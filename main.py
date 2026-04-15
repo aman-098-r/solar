@@ -17,6 +17,7 @@ Model: MobileNetV3Large (Keras) pickled as solar_model.pkl
 
 import io
 import os
+import sys
 import warnings
 
 # Silence TensorFlow noisy C++ warnings
@@ -47,7 +48,12 @@ from fastapi.responses import StreamingResponse
 FIREBASE_DB_URL = (
     "https://solar-cleaning-major-project-default-rtdb.firebaseio.com"
 )
-MODEL_PATH = Path(__file__).parent / "solar_model.pkl"
+MODEL_DIR = Path(__file__).parent
+MODEL_CANDIDATE_PATHS = [
+    MODEL_DIR / "solar_model_patched.keras",
+    MODEL_DIR / "solar_model.pkl",
+    MODEL_DIR / "solar_model_backup.pkl",
+]
 WEBCAM_INDEX = 0          # Preferred webcam index
 WEBCAM_BACKEND = cv2.CAP_DSHOW  # Stable backend on Windows
 INFERENCE_INTERVAL = 5    # seconds between automatic predictions
@@ -57,6 +63,7 @@ CAMERA_RECONNECT_DELAY = 1.0
 CAPTURE_TARGET_FPS = 30.0
 STREAM_TARGET_FPS = 16.0
 STALE_FRAME_RECONNECT_SECONDS = 20.0
+AUTO_START_INFERENCE = True
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -64,34 +71,60 @@ STALE_FRAME_RECONNECT_SECONDS = 20.0
 _model = None
 _model_loaded = False
 _model_lock = threading.Lock()
+_model_error: Optional[str] = None
 
 
 def load_model() -> Optional[object]:
-    global _model, _model_loaded
+    global _model, _model_loaded, _model_error
     if _model_loaded:
         return _model
 
     with _model_lock:
         if _model_loaded:
             return _model
-        if MODEL_PATH.exists():
+        existing_candidates = [p for p in MODEL_CANDIDATE_PATHS if p.exists()]
+        if existing_candidates:
             try:
-                # The pkl contains a Keras model — TF must be available
                 import tensorflow as tf  # noqa: F401 (validates TF is installed)
                 tf.get_logger().setLevel("ERROR")
                 try:
                     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
                 except Exception:
                     pass
-                with open(MODEL_PATH, "rb") as f:
-                    _model = pickle.load(f)
-                print(f"[Model] Loaded Keras model from {MODEL_PATH}")
             except Exception as e:
-                print(f"[Model] [ERROR] Failed to load model: {e}")
                 _model = None
+                _model_loaded = False
+                _model_error = f"TensorFlow import failed: {e}"
+                print(f"[Model] [ERROR] {_model_error}")
+                return _model
+
+            for model_path in existing_candidates:
+                try:
+                    if model_path.suffix == ".keras":
+                        _model = tf.keras.models.load_model(model_path, compile=False)
+                    else:
+                        if sys.version_info >= (3, 13):
+                            # Known unstable on this runtime for pickle-serialized Keras models.
+                            raise RuntimeError(
+                                "Skipping pickle model on Python 3.13 (incompatible runtime crash risk)"
+                            )
+                        with open(model_path, "rb") as f:
+                            _model = pickle.load(f)
+
+                    _model_loaded = True
+                    _model_error = None
+                    print(f"[Model] Loaded model from {model_path}")
+                    return _model
+                except Exception as e:
+                    _model = None
+                    _model_loaded = False
+                    _model_error = f"{model_path.name}: {e}"
+                    print(f"[Model] [ERROR] Failed loading {model_path.name}: {e}")
         else:
-            print(f"[Model] [WARNING] solar_model.pkl not found at {MODEL_PATH} - stub mode active")
-        _model_loaded = True
+            candidates = ", ".join(str(p.name) for p in MODEL_CANDIDATE_PATHS)
+            print(f"[Model] [WARNING] Model file not found. Tried: {candidates}")
+            _model_loaded = False
+            _model_error = f"Model file not found. Tried: {candidates}"
         return _model
 
 
@@ -243,8 +276,13 @@ async def lifespan(app):
     # Load model in background so camera stream is available immediately.
     def _warm_model():
         try:
-            load_model()
-            print("✅ Model loaded")
+            model = load_model()
+            if model is not None:
+                print("✅ Model loaded")
+                if AUTO_START_INFERENCE and start_inference_loop():
+                    print("✅ Auto inference started")
+            else:
+                print("❌ Model not loaded - auto inference not started")
         except Exception as e:
             print(f"❌ Model error: {e}")
 
@@ -310,7 +348,7 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
 # Inference
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_inference(frame: np.ndarray) -> dict:
+def run_inference(frame: np.ndarray, allow_stub: bool = True) -> dict:
     """
     Run the solar panel cleanliness model on a single frame.
     Returns a dict with:
@@ -323,6 +361,17 @@ def run_inference(frame: np.ndarray) -> dict:
     """
     model = load_model()
     ts = int(time.time() * 1000)
+
+    if model is None and not allow_stub:
+        return {
+            "label": "ModelUnavailable",
+            "cls_probability": 0.0,
+            "cleanliness_score": 0.0,
+            "dust_severity": 0.0,
+            "stub": False,
+            "error": "Model not loaded",
+            "timestamp": ts,
+        }
 
     if model is None:
         # Stub mode: estimate cleanliness from frame brightness
@@ -345,9 +394,21 @@ def run_inference(frame: np.ndarray) -> dict:
         inp = preprocess_frame(frame)
         predictions = model.predict(inp, verbose=0)
 
-        # The model returns a dict: {'cls': array([[prob]]), 'dust': array([[severity]])}
-        cls_prob = float(np.squeeze(predictions["cls"]))    # 0-1
-        dust_val = float(np.squeeze(predictions["dust"]))   # 1-10
+        # Accept dict or list outputs depending on model export format.
+        if isinstance(predictions, dict):
+            cls_prob = float(np.squeeze(predictions.get("cls", 0.0)))
+            dust_val = float(np.squeeze(predictions.get("dust", 5.0)))
+        elif isinstance(predictions, (list, tuple)):
+            cls_prob = float(np.squeeze(predictions[0])) if len(predictions) >= 1 else 0.0
+            dust_val = float(np.squeeze(predictions[1])) if len(predictions) >= 2 else 5.0
+        else:
+            arr = np.asarray(predictions)
+            if arr.ndim >= 2 and arr.shape[-1] >= 2:
+                cls_prob = float(arr[0][0])
+                dust_val = float(arr[0][1])
+            else:
+                cls_prob = float(np.squeeze(arr))
+                dust_val = 5.0
 
         label = "Clean" if cls_prob > 0.5 else "Dusty"
         cleanliness_score = round(cls_prob * 100, 2)        # 0-100
@@ -387,8 +448,11 @@ def _inference_loop():
     while _inference_running:
         frame = camera.get_frame()
         if frame is not None:
-            result = run_inference(frame)
-            push_to_firebase(result)
+            result = run_inference(frame, allow_stub=False)
+            if "error" in result:
+                print(f"[Inference] Skipped push: {result['error']}")
+            else:
+                push_to_firebase(result)
         time.sleep(INFERENCE_INTERVAL)
     print("[Inference] Loop stopped")
 
@@ -398,6 +462,16 @@ def stop_inference_loop():
     _inference_running = False
     if _inference_thread and _inference_thread.is_alive():
         _inference_thread.join(timeout=2)
+
+
+def start_inference_loop():
+    global _inference_running, _inference_thread
+    if _inference_running:
+        return False
+    _inference_running = True
+    _inference_thread = threading.Thread(target=_inference_loop, daemon=True)
+    _inference_thread.start()
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -453,6 +527,7 @@ def generate_mjpeg():
 
 @app.get("/health")
 def health():
+    active_model_path = next((p for p in MODEL_CANDIDATE_PATHS if p.exists()), None)
     return {
         "status": "ok",
         "service": "solar-python-backend",
@@ -461,8 +536,9 @@ def health():
         "camera_running": camera._running,
         "camera_index": camera._active_index,
         "camera_has_frame": camera.get_frame() is not None,
-        "model_path": str(MODEL_PATH),
-        "model_exists": MODEL_PATH.exists(),
+        "model_path": str(active_model_path) if active_model_path else None,
+        "model_exists": active_model_path is not None,
+        "model_error": _model_error,
     }
 
 
@@ -487,19 +563,20 @@ def predict():
     frame = camera.get_frame()
     if frame is None:
         return {"success": False, "error": "No frame from camera"}
-    result = run_inference(frame)
+    result = run_inference(frame, allow_stub=False)
+    if "error" in result:
+        return {"success": False, **result}
     push_to_firebase(result)
     return {"success": True, **result}
 
 
 @app.post("/start_inference")
 def start_inference():
-    global _inference_running, _inference_thread
     if _inference_running:
         return {"status": "already_running"}
-    _inference_running = True
-    _inference_thread = threading.Thread(target=_inference_loop, daemon=True)
-    _inference_thread.start()
+    if load_model() is None:
+        return {"status": "error", "error": "Model not loaded"}
+    start_inference_loop()
     return {"status": "started", "interval_seconds": INFERENCE_INTERVAL}
 
 
@@ -525,3 +602,4 @@ def snapshot():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=5001, reload=False)
+
