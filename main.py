@@ -317,7 +317,7 @@ def push_to_firebase(payload: dict):
         url = f"{FIREBASE_DB_URL}/prediction.json"
         resp = requests.patch(url, json=payload, timeout=5)
         resp.raise_for_status()
-        print(f"[Firebase] Pushed -> label={payload.get('label')}, score={payload.get('cleanliness_score')}")
+        print(f"[Firebase] Pushed -> label={payload.get('label')}, score={payload.get('score')}")
     except Exception as err:
         print(f"[Firebase] Error pushing data: {err}")
 
@@ -354,7 +354,7 @@ def run_inference(frame: np.ndarray, allow_stub: bool = True) -> dict:
     Returns a dict with:
       - label            : "Clean" or "Dusty"
       - cls_probability  : float 0-1 (prob of being Clean)
-      - cleanliness_score: float 0-100 (100 = perfectly clean)
+      - score            : float 0-100 (100 = perfectly clean)
       - dust_severity    : float 1-10 (10 = very dusty)
       - stub             : bool — True if model not loaded (brightness-based estimate)
       - timestamp        : int ms
@@ -366,7 +366,7 @@ def run_inference(frame: np.ndarray, allow_stub: bool = True) -> dict:
         return {
             "label": "ModelUnavailable",
             "cls_probability": 0.0,
-            "cleanliness_score": 0.0,
+            "score": 0.0,
             "dust_severity": 0.0,
             "stub": False,
             "error": "Model not loaded",
@@ -383,7 +383,7 @@ def run_inference(frame: np.ndarray, allow_stub: bool = True) -> dict:
         return {
             "label": label,
             "cls_probability": round(cleanliness / 100, 4),
-            "cleanliness_score": round(cleanliness, 2),
+            "score": round(cleanliness, 2),
             "dust_severity": dust_severity,
             "stub": True,
             "timestamp": ts,
@@ -411,13 +411,13 @@ def run_inference(frame: np.ndarray, allow_stub: bool = True) -> dict:
                 dust_val = 5.0
 
         label = "Clean" if cls_prob > 0.5 else "Dusty"
-        cleanliness_score = round(cls_prob * 100, 2)        # 0-100
+        score = round(cls_prob * 100, 2)        # 0-100
         dust_severity = round(float(np.clip(dust_val, 1, 10)), 2)
 
         return {
             "label": label,
             "cls_probability": round(cls_prob, 4),
-            "cleanliness_score": cleanliness_score,
+            "score": score,
             "dust_severity": dust_severity,
             "stub": False,
             "timestamp": ts,
@@ -427,7 +427,7 @@ def run_inference(frame: np.ndarray, allow_stub: bool = True) -> dict:
         return {
             "label": "Error",
             "cls_probability": 0.0,
-            "cleanliness_score": 0.0,
+            "score": 0.0,
             "dust_severity": 10.0,
             "stub": False,
             "error": str(e),
